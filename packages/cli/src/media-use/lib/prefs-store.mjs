@@ -1,5 +1,7 @@
+import * as fs from "node:fs";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import { withFileLock } from "./config-lock.mjs";
 import { globalMediaDir } from "./media-home.mjs";
 
 /**
@@ -71,9 +73,25 @@ function readPrefsFile(path) {
 /** Atomic write (tmp + rename) so a crash never leaves a torn file. */
 function writePrefsFile(path, file) {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
+  const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`);
   renameSync(tmp, path);
+}
+
+/**
+ * Read-modify-write under the cross-process lock telemetry.mjs already uses, so
+ * two recorders (parallel agents, or the CLI and a skill) can't drop each
+ * other's key. The read has to happen inside the lock: locking only the write
+ * still lets a slower reader overwrite a faster writer's merge.
+ */
+function mutatePrefsFile(path, mutate) {
+  mkdirSync(dirname(path), { recursive: true });
+  return withFileLock(`${path}.lock`, fs, () => {
+    const file = readPrefsFile(path);
+    const result = mutate(file);
+    writePrefsFile(path, file);
+    return result;
+  });
 }
 
 /** `style_preset` entries are stored per workflow as `style_preset.<workflow>`. */
@@ -113,15 +131,16 @@ function dedupe(list) {
  */
 function recordProjectTier(projectDir, fullKey, value, projectName, now) {
   const path = projectPrefsPath(projectDir);
-  const file = readPrefsFile(path);
-  const previous = file.preferences[fullKey];
-  const keepProvenance = validEntry(previous) && previous.value === value;
-  const confirmedIn = keepProvenance
-    ? dedupe([...(Array.isArray(previous.confirmed_in) ? previous.confirmed_in : []), projectName])
-    : [projectName];
-  file.preferences[fullKey] = { value, confirmed_in: confirmedIn, updated_at: now };
-  writePrefsFile(path, file);
-  return confirmedIn;
+  return mutatePrefsFile(path, (file) => {
+    const previous = file.preferences[fullKey];
+    const keepProvenance = validEntry(previous) && previous.value === value;
+    const previousConfirmedIn = Array.isArray(previous?.confirmed_in) ? previous.confirmed_in : [];
+    const confirmedIn = keepProvenance
+      ? dedupe([...previousConfirmedIn, projectName])
+      : [projectName];
+    file.preferences[fullKey] = { value, confirmed_in: confirmedIn, updated_at: now };
+    return confirmedIn;
+  });
 }
 
 /**
@@ -130,20 +149,20 @@ function recordProjectTier(projectDir, fullKey, value, projectName, now) {
  */
 function recordUserSighting(fullKey, value, projectName, now) {
   const path = userPrefsPath();
-  const file = readPrefsFile(path);
-  const keySightings = isRecord(file.sightings[fullKey]) ? file.sightings[fullKey] : {};
-  const seenIn = dedupe([
-    ...(Array.isArray(keySightings[value]) ? keySightings[value] : []),
-    projectName,
-  ]);
-  keySightings[value] = seenIn;
-  file.sightings[fullKey] = keySightings;
-  const promoted = seenIn.length >= PROMOTE_AT;
-  if (promoted) {
-    file.preferences[fullKey] = { value, confirmed_in: seenIn, updated_at: now };
-  }
-  writePrefsFile(path, file);
-  return promoted;
+  return mutatePrefsFile(path, (file) => {
+    const keySightings = isRecord(file.sightings[fullKey]) ? file.sightings[fullKey] : {};
+    const seenIn = dedupe([
+      ...(Array.isArray(keySightings[value]) ? keySightings[value] : []),
+      projectName,
+    ]);
+    keySightings[value] = seenIn;
+    file.sightings[fullKey] = keySightings;
+    const promoted = seenIn.length >= PROMOTE_AT;
+    if (promoted) {
+      file.preferences[fullKey] = { value, confirmed_in: seenIn, updated_at: now };
+    }
+    return promoted;
+  });
 }
 
 /**

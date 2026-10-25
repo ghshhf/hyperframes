@@ -1,9 +1,11 @@
 import { strict as assert } from "node:assert";
+import { spawn } from "node:child_process";
 import { test } from "node:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  PREFERENCE_KEYS,
   mergedPreferences,
   preferenceKeyFor,
   projectPrefsPath,
@@ -185,5 +187,60 @@ test("corrupt files are treated as empty instead of crashing", () => {
     assert.deepEqual(mergedPreferences(projectA), {});
     const result = recordPreference({ projectDir: projectA, key: "language", value: "zh" });
     assert.equal(result.value, "zh");
+  });
+});
+
+// A separate process per writer is the point: the lost update this guards
+// against happens between processes (parallel agents, CLI + skill), which an
+// in-process async test cannot reproduce.
+async function recordInChild(project, key, env) {
+  const moduleUrl = new URL("./prefs-store.mjs", import.meta.url).href;
+  const script = [
+    "const { recordPreference } = await import(process.argv[1]);",
+    'recordPreference({ projectDir: process.argv[2], key: process.argv[3], value: "v" });',
+  ].join("\n");
+  const child = spawn(
+    process.execPath,
+    ["--input-type=module", "-e", script, moduleUrl, project, key],
+    { env, stdio: ["ignore", "ignore", "pipe"] },
+  );
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const code = await new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", resolve);
+  });
+  assert.equal(code, 0, `child recording "${key}" failed: ${stderr}`);
+}
+
+test("concurrent recorders keep every key instead of losing the slow one", async () => {
+  const savedEnv = { ...process.env };
+  const root = mkdtempSync(join(tmpdir(), "mu-prefs-race-"));
+  const home = join(root, "home");
+  const project = join(root, "proj-race");
+  mkdirSync(home, { recursive: true });
+  mkdirSync(project, { recursive: true });
+  process.env.HYPERFRAMES_MEDIA_HOME = home;
+  try {
+    const keys = PREFERENCE_KEYS.filter((key) => key !== "style_preset");
+    const env = { ...process.env, HYPERFRAMES_MEDIA_HOME: home };
+    await Promise.all(keys.map((key) => recordInChild(project, key, env)));
+
+    const onDisk = JSON.parse(readFileSync(projectPrefsPath(project), "utf8"));
+    assert.deepEqual(Object.keys(onDisk.preferences).sort(), [...keys].sort());
+  } finally {
+    restoreEnv(savedEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the lock and its temp file are cleaned up, so .media stays committable", () => {
+  withSandbox(({ projectA }) => {
+    recordPreference({ projectDir: projectA, key: "language", value: "zh" });
+    const prefs = projectPrefsPath(projectA);
+    assert.equal(existsSync(`${prefs}.lock`), false);
+    assert.equal(existsSync(`${prefs}.${process.pid}.tmp`), false);
   });
 });
